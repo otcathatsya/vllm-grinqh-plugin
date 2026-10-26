@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-grinqh-plugin"
+version = "0.1.0"
+requires-python = ">=3.11,<3.15"
+dependencies = [
+    # we use vLLM internals that may break in later releases, do double-check
+    "vllm>=0.32.0",
+    "compressed-tensors",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[project.entry-points."vllm.general_plugins"]
+grinqh = "grinqh:register"
+
+[tool.setuptools]
+packages = ["grinqh"]
