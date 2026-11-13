@@ -3,6 +3,7 @@ import torch
 
 from grinqh.kernel import (
     grinqh_gemm_or_gemv,
+    grinqh_gemv_batch_union,
     grinqh_prefill_gemm_compiled,
     grinqh_prefill_marlin,
 )
@@ -238,3 +239,44 @@ def test_gemv_thresholds_match_reference(max_bits, dtype, quantiles):
 
     torch.testing.assert_close(Y_grinqh, Y_ref.to(dtype))
 
+
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("max_bits", [2, 4, 6, 8])
+@pytest.mark.parametrize("batch_size", [2, 3, 5, 8])
+def test_batch_union_gemv_matches_looped_gemv(batch_size, max_bits, dtype):
+    in_features = 256
+    out_features = 256
+    group_size = 128
+    original_n = out_features // 4
+
+    X = torch.randn((batch_size, in_features), dtype=dtype, device='cuda')
+    limit = (1 << (max_bits - 1)) - 1
+    W_8bit = torch.randint(-limit - 1, limit + 1, (in_features, out_features), dtype=torch.int8, device='cuda')
+    scales = torch.randn((in_features // group_size, out_features), dtype=dtype, device='cuda')
+
+    shift_amt = 8 - max_bits
+    shuffled = grinqh_input_preshuffle(W_8bit)
+    shifted = shuffled << shift_amt
+    weight_packed = pack_triton(shifted.view(torch.uint32), max_bits=max_bits)
+
+    thresholds = [-1.0, -1.0, -1.0, -1.0]
+    kwargs = dict(
+        weight_packed=weight_packed,
+        weight_scale=scales,
+        bias=None,
+        max_bits=max_bits,
+        group_size=group_size,
+        original_n=original_n,
+        thresholds=thresholds,
+    )
+
+    masked_weights = get_masked_weight_ref(W_8bit, X.abs().amax(0, keepdim=True), thresholds, max_bits)
+    Y_ref = X.float() @ (masked_weights.float() * scales.float().repeat_interleave(group_size, 0))
+
+    Y_batched = grinqh_gemv_batch_union(x=X, **kwargs)
+    Y_looped = torch.cat([grinqh_gemm_or_gemv(x=X[i:i + 1], **kwargs) for i in range(batch_size)])
+
+    torch.testing.assert_close(Y_batched, Y_looped)
+    torch.testing.assert_close(Y_batched, Y_ref.to(dtype), atol=1e-3, rtol=1.6e-2)

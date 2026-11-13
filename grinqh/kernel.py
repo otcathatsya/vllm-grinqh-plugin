@@ -168,6 +168,199 @@ def grinqh_gemv_uint32_packed(
 
 
 @triton.jit
+def grinqh_gemv_uint32_packed_batch_union(
+        Y, A, X, scales,
+        t0: tl.constexpr, t1: tl.constexpr, t2: tl.constexpr, t3: tl.constexpr,
+        N: tl.constexpr, M: tl.constexpr,
+        BATCH_SIZE: tl.constexpr, BLOCK_BATCH: tl.constexpr,
+        SCALES_BLOCK_SIZE_M: tl.constexpr, SCALES_BLOCK_SIZE_N: tl.constexpr,
+        MAX_BITS: tl.constexpr,
+        BLOCK_N: tl.constexpr, BLOCK_M: tl.constexpr, NUM_BLOCK_M_LOOPS: tl.constexpr,
+):
+    pid_n = tl.program_id(0)
+    pid_m = tl.program_id(1)
+
+    accum_dtype = tl.float32
+
+    num_zones: tl.constexpr = MAX_BITS // 2
+    padded_zones: tl.constexpr = 4 if num_zones > 2 else num_zones
+    a_row_stride: tl.constexpr = num_zones * (N // 4)
+
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    zone_indices = tl.arange(0, padded_zones)
+    safe_zone_indices = tl.where(zone_indices < num_zones, zone_indices, 0)
+    offs_n_zones = (
+            safe_zone_indices[:, None] * (N // 4) + offs_n[None, :]
+    )
+
+    batch_offsets = tl.arange(0, BLOCK_BATCH)
+    batch_mask = batch_offsets < BATCH_SIZE
+    acc = tl.zeros(
+        (BLOCK_BATCH, 4, 4, BLOCK_N),
+        dtype=accum_dtype,
+    )
+
+    neighbourhood_indices = tl.arange(0, 4)
+    y_loc_base = neighbourhood_indices[:, None] * N + offs_n[None, :]
+    zone_offsets = neighbourhood_indices[:, None, None] * (N // 4)
+    y_ptr = y_loc_base[None, :, :] + zone_offsets
+
+    bias_base: tl.constexpr = 1 << (MAX_BITS - 1)
+    bias_t0: tl.constexpr = bias_base >> 2
+    bias_t1: tl.constexpr = bias_base >> 4
+    bias_t2: tl.constexpr = bias_base >> 6
+    bias_t3: tl.constexpr = bias_base >> 8
+
+    delta_t0: tl.constexpr = bias_t0
+    delta_t1: tl.constexpr = bias_t1 - bias_t0
+    delta_t2: tl.constexpr = bias_t2 - bias_t1
+    delta_t3: tl.constexpr = bias_t3 - bias_t2
+
+    zone_indices_bc = tl.arange(0, padded_zones)[None, :]
+    precision_mask = zone_indices_bc < num_zones
+
+    shift_dest = (
+                         3
+                         - tl.arange(0, padded_zones)[None, :, None].to(tl.uint32)
+                 ) * 2
+    byte_iter = tl.arange(0, 4)[:, None, None, None]
+    shift_amt = byte_iter * 8
+
+    for iblockm in range(NUM_BLOCK_M_LOOPS):
+        offs_m = (
+                pid_m * BLOCK_M * NUM_BLOCK_M_LOOPS
+                + tl.arange(0, BLOCK_M)
+                + iblockm * BLOCK_M
+        )
+
+        a_loc = A[None] + (
+                offs_m[:, None, None] * a_row_stride
+                + offs_n_zones[None, :, :]
+        )
+        x_loc = X + batch_offsets[:, None] * M + offs_m[None, :]
+        x_mask = batch_mask[:, None] & (offs_m[None, :] < M)
+        x_chunk = tl.load(
+            x_loc,
+            mask=x_mask,
+            other=0.0,
+            eviction_policy="evict_last",
+        )
+
+        union_abs_x = tl.max(tl.abs(x_chunk), axis=0)
+        threshold_mask = tl.where(
+            zone_indices_bc == 0,
+            (union_abs_x > t0)[:, None],
+            tl.where(
+                zone_indices_bc == 1,
+                (union_abs_x > t1)[:, None],
+                tl.where(
+                    zone_indices_bc == 2,
+                    (union_abs_x > t2)[:, None],
+                    (union_abs_x > t3)[:, None],
+                ),
+            ),
+        )
+
+        b0 = (
+            tl.where(union_abs_x > t0, delta_t0, 0)
+            if num_zones > 0
+            else 0
+        )
+        b1 = (
+            tl.where(union_abs_x > t1, delta_t1, 0)
+            if num_zones > 1
+            else 0
+        )
+        b2 = (
+            tl.where(union_abs_x > t2, delta_t2, 0)
+            if num_zones > 2
+            else 0
+        )
+        b3 = (
+            tl.where(union_abs_x > t3, delta_t3, 0)
+            if num_zones > 3
+            else 0
+        )
+
+        biases_per_input = b0 + b1 + b2 + b3
+        bias_total = tl.sum(
+            biases_per_input[None, :] * x_chunk.to(accum_dtype),
+            axis=1,
+        )
+
+        zone_active_mask = threshold_mask & precision_mask
+        mask_load = (
+                zone_active_mask[:, :, None]
+                & (offs_n[None, None, :] < (N // 4))
+                & (offs_m[:, None, None] < M)
+        )
+        a_packed = tl.load(
+            a_loc,
+            mask=mask_load,
+            other=0.0,
+            eviction_policy="evict_first",
+        )
+
+        weights_unpacked = tl.zeros(
+            (BLOCK_M, 4, BLOCK_N),
+            dtype=tl.uint32,
+        )
+        for neighbourhood in tl.static_range(0, 4):
+            shift_src = (3 - neighbourhood) * 2
+            bits_isolated = (
+                                    a_packed >> shift_src
+                            ) & 0x03030303
+            bits_positioned = bits_isolated << shift_dest
+            weight_zone_value = tl.sum(bits_positioned, 1)
+            weights_unpacked = tl.where(
+                neighbourhood_indices[None, :, None] == neighbourhood,
+                weight_zone_value[:, None, :],
+                weights_unpacked,
+            )
+
+        weight_raw = (
+                             weights_unpacked[None, :, :, :] >> shift_amt
+                     ) & 0xFF
+        weight_float = weight_raw.to(tl.int8) >> (8 - MAX_BITS)
+
+        offs_n_scale = y_ptr // SCALES_BLOCK_SIZE_N
+        offs_m_scale = (
+                               pid_m * BLOCK_M * NUM_BLOCK_M_LOOPS
+                               + iblockm * BLOCK_M
+                       ) // SCALES_BLOCK_SIZE_M
+        scale_values = tl.load(
+            scales
+            + offs_m_scale * (N * 4 // SCALES_BLOCK_SIZE_N)
+            + offs_n_scale,
+            mask=(offs_n[None, None, :] < (N // 4)),
+            other=0.0,
+        ).to(accum_dtype)
+
+        partial_result = bias_total[:, None, None, None] + tl.sum(
+            weight_float[None, :, :, :, :]
+            * x_chunk[:, None, :, None, None].to(accum_dtype),
+            axis=2,
+        )
+        acc += scale_values[None, :, :, :] * partial_result
+
+    output_ptr = (
+            Y
+            + batch_offsets[:, None, None, None] * (N * 4)
+            + y_ptr[None, :, :, :]
+    )
+    output_mask = (
+            batch_mask[:, None, None, None]
+            & (offs_n[None, None, None, :] < (N // 4))
+    )
+    tl.atomic_add(
+        output_ptr,
+        acc,
+        mask=output_mask,
+        sem="relaxed",
+    )
+
+
+@triton.jit
 def _grinqh_to_marlin_int4_kernel(
         grinqh_ptr,
         marlin_ptr,
@@ -409,6 +602,45 @@ def get_env_config():
 
 
 GEMV_CONFIG = get_env_config()
+
+
+def grinqh_gemv_batch_union(
+        x: torch.Tensor,
+        weight_packed: torch.Tensor,
+        weight_scale: torch.Tensor,
+        bias: Optional[torch.Tensor],
+        max_bits: int,
+        group_size: int,
+        original_n: int,
+        thresholds: List[float],
+) -> torch.Tensor:
+    x_flat = x.view(-1, x.shape[-1])
+    batch_size = x_flat.shape[0]
+    M, _ = weight_packed.shape
+    N = original_n
+
+    grid = lambda META: (
+        triton.cdiv(N // 4, META["BLOCK_N"]),
+        triton.cdiv(M // META["NUM_BLOCK_M_LOOPS"], META["BLOCK_M"]),
+    )
+    y = torch.zeros((batch_size, N * 4), device=x.device, dtype=torch.float32)
+
+    grinqh_gemv_uint32_packed_batch_union[grid](
+        Y=y, A=weight_packed, X=x_flat, scales=weight_scale,
+        t0=thresholds[0], t1=thresholds[1],
+        t2=thresholds[2], t3=thresholds[3],
+        N=N, M=M, BATCH_SIZE=batch_size, BLOCK_BATCH=triton.next_power_of_2(batch_size),
+        SCALES_BLOCK_SIZE_M=group_size, SCALES_BLOCK_SIZE_N=1, MAX_BITS=max_bits,
+        BLOCK_N=GEMV_CONFIG.kwargs["BLOCK_N"], BLOCK_M=GEMV_CONFIG.kwargs["BLOCK_M"],
+        NUM_BLOCK_M_LOOPS=GEMV_CONFIG.kwargs["NUM_BLOCK_M_LOOPS"],
+        num_warps=GEMV_CONFIG.num_warps, num_stages=GEMV_CONFIG.num_stages
+    )
+
+    y = y.to(x.dtype)
+    if bias is not None:
+        y.add_(bias)
+
+    return y.view(*x.shape[:-1], N * 4)
 
 
 @torch.library.custom_op("grinqh::gemm_or_gemv", mutates_args=[])
